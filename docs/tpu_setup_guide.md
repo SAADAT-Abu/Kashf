@@ -152,6 +152,10 @@ source ~/miniconda3/bin/activate kashf
 
 # Persist activation across SSH sessions and tmux windows
 echo 'source ~/miniconda3/bin/activate kashf' >> ~/.bashrc
+
+# Make libpython3.10.so.1.0 findable by torch_xla (lives inside the conda env)
+export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH
+echo 'export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
 ```
 
 Now install PyTorch (CPU build — no CUDA on TPU VMs) and torch_xla:
@@ -386,6 +390,9 @@ gcloud compute tpus queued-resources delete kashf-qr-1 \
 |---|---|
 | `WAITING_FOR_RESOURCES` for > 30 min | Try `--zone=us-east1-d` with v6e chips (64 available) |
 | `ModuleNotFoundError: torch_xla` after SSH | Run `source ~/miniconda3/bin/activate kashf` — conda env not active |
+| `ImportError: libpython3.10.so.1.0: cannot open shared object file` | Run `export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH` and add to `~/.bashrc` |
+| `WARNING: Defaulting to PJRT_DEVICE=CPU` / `Unsupported nprocs (8)` | TPU not detected — run `export PJRT_DEVICE=TPU` and add to `~/.bashrc`, then retry |
+| `UserWarning: Casting complex values to real discards the imaginary part` | Stale install of kashf — run `pip install --force-reinstall ~/kashf` to pick up the real-valued RoPE fix |
 | `RuntimeError: torch_xla not found` | Re-run the pip install in Step 6 inside the conda env |
 | Script freezes at startup | Normal — XLA compilation takes 60–90 s |
 | `OOM on chip` | Reduce `MICRO_BATCH` from 4 to 2 in `train_fineweb_tpu.py` |

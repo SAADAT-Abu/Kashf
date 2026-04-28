@@ -69,21 +69,24 @@ class RMSNorm(nn.Module):
 def precompute_rope_freqs(
     dim: int, max_len: int, theta: float = 500000.0
 ) -> torch.Tensor:
-    """Precompute complex RoPE rotation matrices for positions 0..max_len-1."""
+    """Precompute RoPE cos/sin tables for positions 0..max_len-1.
+
+    Returns a real float32 tensor of shape (max_len, dim//2, 2) — [cos, sin] pairs.
+    Avoids complex dtypes so the buffer survives .to(bfloat16) without data loss.
+    """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(max_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    freqs = torch.outer(t, freqs)                           # (max_len, dim//2)
+    return torch.stack([freqs.cos(), freqs.sin()], dim=-1)  # (max_len, dim//2, 2)
 
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     """Apply rotary positional embeddings to a query or key tensor (B, T, H, head_dim)."""
-    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return (
-        torch.view_as_real(xc * freqs_cis.unsqueeze(0).unsqueeze(2))
-        .flatten(-2)
-        .to(x.dtype)
-    )
+    cos = freqs_cis[..., 0].float().unsqueeze(0).unsqueeze(2)  # (1, T, 1, head_dim//2)
+    sin = freqs_cis[..., 1].float().unsqueeze(0).unsqueeze(2)  # (1, T, 1, head_dim//2)
+    x1 = x[..., 0::2].float()   # even features  (B, T, H, head_dim//2)
+    x2 = x[..., 1::2].float()   # odd features   (B, T, H, head_dim//2)
+    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2).to(x.dtype)
 
 
 def loop_index_embedding(
