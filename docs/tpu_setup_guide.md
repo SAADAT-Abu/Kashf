@@ -135,29 +135,53 @@ You are now inside the `kashf` tmux session. Training will continue here even if
 
 ---
 
-## Step 6 — Install PyTorch XLA and dependencies
+## Step 6 — Install Miniconda and set up a Python 3.10 environment
+
+The TPU VM ships with Python 3.8, which has no stable `torch_xla` wheel. The `python3.10-venv` and `python3.10-dev` apt packages are also unavailable on this image. **Miniconda** is the most reliable way to get a clean Python 3.10 environment.
 
 ```bash
-# PyTorch + torch_xla matched to TPU v4 libtpu
-pip install torch~=2.5.0 \
-            torch_xla[tpu]~=2.5.0 \
-            -f https://storage.googleapis.com/libtpu-releases/index.html
+# Download and install Miniconda (non-interactive)
+wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
+bash ~/miniconda.sh -b -p ~/miniconda3
+
+# Create a Python 3.10 environment named "kashf"
+~/miniconda3/bin/conda create -n kashf python=3.10 -y
+
+# Activate it
+source ~/miniconda3/bin/activate kashf
+
+# Persist activation across SSH sessions and tmux windows
+echo 'source ~/miniconda3/bin/activate kashf' >> ~/.bashrc
+```
+
+Now install PyTorch (CPU build — no CUDA on TPU VMs) and torch_xla:
+
+```bash
+pip install --upgrade pip
+pip install torch==2.4.0+cpu --index-url https://download.pytorch.org/whl/cpu
+pip install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.4.0-cp310-cp310-linux_x86_64.whl
 
 # Dataset + tokenizer libraries
 pip install datasets transformers
+```
 
-# Verify torch_xla sees the TPU
+Verify torch_xla sees the TPU:
+
+```bash
 python - <<'EOF'
+import torch
 import torch_xla.core.xla_model as xm
+print("torch:", torch.__version__)
+print("torch_xla:", __import__("torch_xla").__version__)
 print("XLA device:", xm.xla_device())
-print("Chips available:", xm.xrt_world_size() if hasattr(xm, 'xrt_world_size') else "check PJRT_DEVICE")
 EOF
 ```
 
 Expected output:
 ```
+torch: 2.4.0+cpu
+torch_xla: 2.4.0
 XLA device: xla:0
-Chips available: 8
 ```
 
 ---
@@ -166,7 +190,7 @@ Chips available: 8
 
 ```bash
 git clone https://github.com/SAADAT-Abu/kashf ~/kashf
-pip install -e ~/kashf
+pip install ~/kashf
 ```
 
 Verify the install:
@@ -361,7 +385,8 @@ gcloud compute tpus queued-resources delete kashf-qr-1 \
 | Problem | Fix |
 |---|---|
 | `WAITING_FOR_RESOURCES` for > 30 min | Try `--zone=us-east1-d` with v6e chips (64 available) |
-| `RuntimeError: torch_xla not found` | Re-run the pip install in Step 6 |
+| `ModuleNotFoundError: torch_xla` after SSH | Run `source ~/miniconda3/bin/activate kashf` — conda env not active |
+| `RuntimeError: torch_xla not found` | Re-run the pip install in Step 6 inside the conda env |
 | Script freezes at startup | Normal — XLA compilation takes 60–90 s |
 | `OOM on chip` | Reduce `MICRO_BATCH` from 4 to 2 in `train_fineweb_tpu.py` |
 | Spot preempted mid-run | Follow Step 12; checkpoints every 500 steps (~262M tokens) |
