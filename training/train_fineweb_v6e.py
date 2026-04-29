@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """
-Kashf — TPU v4 pretraining on FineWeb-Edu (HuggingFaceFW/fineweb-edu, sample-10BT).
+Kashf — TPU v6e (Trillium) pretraining on FineWeb-Edu (HuggingFaceFW/fineweb-edu, sample-10BT).
 Multi-chip data-parallel training via torch_xla.
 
-    python training/train_fineweb_tpu.py [--nprocs 8]
+    PJRT_DEVICE=TPU python training/train_fineweb_v6e.py [--nprocs 8]
 
-TPU:     v4-8  (8 chips × 32 GB HBM each)
+Provision:
+    gcloud compute tpus queued-resources create kashf-qr-v6e \
+      --node-id=kashf-v6e --project=kashf-494319 \
+      --zone=europe-west4-a --accelerator-type=v6e-8 \
+      --runtime-version=v2-alpha-tpuv6e --spot
+
+TPU:     v6e-8  (8 chips × 32 GB HBM, ~2–4× MXU throughput vs v4)
 Dataset: FineWeb-Edu sample-10BT (~10B tokens of high-quality educational web text)
 Context: 4096 tokens
-Batch:   8 chips × 4 micro × 4 accum × 4096 = 524,288 tokens / step
+Batch:   8 chips × 8 micro × 2 accum × 4096 = 524,288 tokens / step  (same as v4 script)
 Steps:   ~19,073 for 10B tokens
-Est:     ~6–8 hours on v4-8
+Est:     ~2–4 hours on v6e-8
 
-Key differences vs. GPU scripts:
-  - torch_xla replaces CUDA — no torch.compile, no AMP autocast, no fused optimizer
-  - Model is cast to bfloat16 up front (TPU's native dtype)
-  - xm.optimizer_step() all-reduces gradients across chips before updating weights
-  - pl.MpDeviceLoader prefetches batches to each chip asynchronously
-  - Dataset sharded by XMP ordinal — each chip sees a distinct slice
-  - .item() / .backward() are lazy in XLA; xm.mark_step() flushes the graph
-  - Checkpoints written only from the master chip; xm.rendezvous() keeps chips in sync
+Differences vs. train_fineweb_tpu.py (v4):
+  - MICRO_BATCH 4 → 8:  larger per-chip batch better saturates v6e's wider MXU
+  - GRAD_ACCUM  4 → 2:  fewer accumulation passes per step — same global batch, less overhead
+  - LOG_EVERY  20 → 10: steps are the same count but land faster; denser progress output
+  - CKPT_EVERY 500 → 500: unchanged — checkpoints every ~262M tokens
 """
 
 import os
@@ -41,22 +44,22 @@ from kashf.model import KashfConfig, KashfModel
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 
-SEQ_LEN       = 4096         # full context window — TPU HBM supports this comfortably
-MICRO_BATCH   = 4            # per-chip; 4 × 4096 = 16,384 tokens / chip / accum-step
-GRAD_ACCUM    = 4            # accumulation steps before weight update
-# Global batch (v4-8): 4 micro × 8 chips × 4 accum × 4096 = 524,288 tokens / step
+SEQ_LEN       = 4096
+MICRO_BATCH   = 8            # per-chip; v6e MXU is ~2–4× wider — double the micro batch
+GRAD_ACCUM    = 2            # halved vs v4; global batch stays 524,288 tokens/step
+# Global batch (v6e-8): 8 micro × 8 chips × 2 accum × 4096 = 524,288 tokens / step
 
 LR            = 3e-4
 MIN_LR        = 3e-5
 WEIGHT_DECAY  = 0.1
 WARMUP_STEPS  = 500          # ~2.6% of ~19,073 total steps
-TARGET_TOKENS = 10_000_000_000   # full FineWeb-Edu sample-10BT pass
+TARGET_TOKENS = 10_000_000_000
 
-LOG_EVERY     = 20           # print every N optimizer steps (each step = GRAD_ACCUM forward passes)
-CKPT_EVERY    = 500          # checkpoint every N steps; keep last 3
+LOG_EVERY     = 10           # steps land faster on v6e — log more frequently
+CKPT_EVERY    = 500          # checkpoint every ~262M tokens; keep last 3
 CKPT_DIR      = os.environ.get("KASHF_CKPT_DIR", "kashf_checkpoints")
 GRAD_CLIP     = 1.0
-USE_GRAD_CKPT = False        # 32 GB HBM per chip is enough — disabled for maximum speed
+USE_GRAD_CKPT = False        # 32 GB HBM per chip is sufficient
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
 
@@ -122,7 +125,6 @@ def save_checkpoint(model, optimizer, step: int, cfg, ckpt_dir: str, keep_last: 
     os.makedirs(ckpt_dir, exist_ok=True)
     path = os.path.join(ckpt_dir, f"step_{step:07d}.pt")
     tmp  = path + ".tmp"
-    # xm.save() flushes all pending XLA ops before writing — safe on TPU
     xm.save(
         {"step": step, "model": model.state_dict(),
          "optimizer": optimizer.state_dict(), "cfg": cfg},
@@ -159,7 +161,6 @@ def _train_fn(index: int, cli_args):
         if is_master:
             print(*a, **kw, flush=True)
 
-    # Tokenizer files are already cached by main() before spawn — no download race
     tok        = AutoTokenizer.from_pretrained("gpt2")
     vocab_size = tok.vocab_size   # 50257
 
@@ -179,7 +180,6 @@ def _train_fn(index: int, cli_args):
         rope_theta       = 500_000.0,
     )
 
-    # Cast to bfloat16 before moving to device — TPU's native dtype; no autocast wrapper needed
     model = KashfModel(cfg).to(torch.bfloat16).to(device)
 
     if is_master:
@@ -188,7 +188,6 @@ def _train_fn(index: int, cli_args):
         mprint(f"Chips      : {world_size}  |  SEQ_LEN: {SEQ_LEN}  |  micro-batch/chip: {MICRO_BATCH}")
 
     # ── Optimizer ─────────────────────────────────────────────────────────────
-    # fused=True is a CUDA-only kernel — not used on XLA
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LR,
         weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95),
@@ -200,7 +199,6 @@ def _train_fn(index: int, cli_args):
     if existing:
         mprint(f"Resuming from {existing[-1]}")
         start_step = load_checkpoint(model, optimizer, existing[-1])
-        # Optimizer states were loaded to CPU; move them to the XLA device
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
@@ -212,10 +210,9 @@ def _train_fn(index: int, cli_args):
     loader  = DataLoader(
         dataset,
         batch_size=MICRO_BATCH,
-        num_workers=2,       # sample-10BT caps at 3 shards; 2 keeps total workers (2×8=16) reasonable
+        num_workers=2,
         prefetch_factor=2,
     )
-    # MpDeviceLoader asynchronously prefetches the next batch to the chip
     device_loader = pl.MpDeviceLoader(loader, device)
 
     # ── Derived training constants ─────────────────────────────────────────────
@@ -234,8 +231,7 @@ def _train_fn(index: int, cli_args):
     t0         = time.perf_counter()
     step       = start_step
 
-    # Lazy XLA tensor for loss — avoids forcing a graph flush inside the micro-batch loop
-    step_loss = torch.zeros((), dtype=torch.float32, device=device)
+    step_loss  = torch.zeros((), dtype=torch.float32, device=device)
     step_gnorm = torch.zeros((), dtype=torch.float32, device=device)
 
     while step < total_steps:
@@ -246,7 +242,6 @@ def _train_fn(index: int, cli_args):
         step_loss  = torch.zeros((), dtype=torch.float32, device=device)
         step_gnorm = torch.zeros((), dtype=torch.float32, device=device)
 
-        # Gradient accumulation — forward + backward GRAD_ACCUM times before stepping
         for _ in range(GRAD_ACCUM):
             try:
                 x, y = next(data_iter)
@@ -265,20 +260,17 @@ def _train_fn(index: int, cli_args):
             ) / GRAD_ACCUM
             loss.backward()
 
-            # Accumulate without .item() — stays lazy in the XLA graph
             with torch.no_grad():
                 step_loss = step_loss + loss.detach()
 
-        # Clip local gradients, then all-reduce across chips and apply the update
         gnorm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         with torch.no_grad():
             step_gnorm = step_gnorm + gnorm
 
-        xm.optimizer_step(optimizer)   # all-reduce gradients + weight update
+        xm.optimizer_step(optimizer)
         step += 1
 
         if step % LOG_EVERY == 0:
-            # Flush all pending XLA ops before reading tensor values
             xm.mark_step()
             dt          = time.perf_counter() - t0
             tok_per_sec = global_batch_tok * LOG_EVERY / dt
@@ -295,7 +287,6 @@ def _train_fn(index: int, cli_args):
             if is_master:
                 save_checkpoint(model, optimizer, step, cfg, CKPT_DIR)
 
-    # Final checkpoint if the run didn't land exactly on a CKPT_EVERY boundary
     if step > start_step and step % CKPT_EVERY != 0:
         xm.mark_step()
         if is_master:
@@ -308,14 +299,13 @@ def _train_fn(index: int, cli_args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kashf TPU training on FineWeb-Edu")
+    parser = argparse.ArgumentParser(description="Kashf v6e training on FineWeb-Edu")
     parser.add_argument(
         "--nprocs", type=int, default=8,
-        help="Number of TPU chips to use (8 for v4-8, 4 for a single TPU board)",
+        help="Number of TPU chips to use (8 for v6e-8)",
     )
     cli_args = parser.parse_args()
 
-    # Pre-cache tokenizer before spawning — avoids every chip racing to download it
     print("Pre-caching GPT-2 tokenizer...")
     AutoTokenizer.from_pretrained("gpt2")
 

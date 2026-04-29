@@ -153,9 +153,11 @@ source ~/miniconda3/bin/activate kashf
 # Persist activation across SSH sessions and tmux windows
 echo 'source ~/miniconda3/bin/activate kashf' >> ~/.bashrc
 
-# Make libpython3.10.so.1.0 findable by torch_xla (lives inside the conda env)
-export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH
-echo 'export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
+# Make libpython3.10.so.1.0 findable by torch_xla — scoped to the conda env
+# so system tools (git, gsutil) are not affected when the env is inactive
+mkdir -p ~/miniconda3/envs/kashf/etc/conda/activate.d
+echo 'export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH' \
+  > ~/miniconda3/envs/kashf/etc/conda/activate.d/ld_library_path.sh
 ```
 
 Now install PyTorch (CPU build — no CUDA on TPU VMs) and torch_xla:
@@ -390,7 +392,12 @@ gcloud compute tpus queued-resources delete kashf-qr-1 \
 |---|---|
 | `WAITING_FOR_RESOURCES` for > 30 min | Try `--zone=us-east1-d` with v6e chips (64 available) |
 | `ModuleNotFoundError: torch_xla` after SSH | Run `source ~/miniconda3/bin/activate kashf` — conda env not active |
+<<<<<<< HEAD
 | `ImportError: libpython3.10.so.1.0: cannot open shared object file` | Run `export LD_LIBRARY_PATH=$HOME/miniconda3/envs/kashf/lib:$LD_LIBRARY_PATH` and add to `~/.bashrc` |
+=======
+| `ImportError: libpython3.10.so.1.0: cannot open shared object file` | `LD_LIBRARY_PATH` not set — re-activate the conda env: `source ~/miniconda3/bin/activate kashf` |
+| `git: symbol lookup error: libp11-kit.so.0: undefined symbol: ffi_type_pointer` | Conda's `libffi` is shadowing the system's via a global `LD_LIBRARY_PATH`. Use `env -u LD_LIBRARY_PATH git clone ...` and move the export to the conda activation hook (see Step 6) |
+>>>>>>> 47b32bf (Fix checkpoint deadlock: replace xm.rendezvous with xm.mark_step)
 | `WARNING: Defaulting to PJRT_DEVICE=CPU` / `Unsupported nprocs (8)` | TPU not detected — run `export PJRT_DEVICE=TPU` and add to `~/.bashrc`, then retry |
 | `UserWarning: Casting complex values to real discards the imaginary part` | Stale install of kashf — run `pip install --force-reinstall ~/kashf` to pick up the real-valued RoPE fix |
 | `RuntimeError: torch_xla not found` | Re-run the pip install in Step 6 inside the conda env |
