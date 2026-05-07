@@ -225,7 +225,7 @@ def _train_fn(index: int, cli_args):
         n_heads          = 4,
         head_dim         = 64,
         max_seq_len      = SEQ_LEN,
-        max_loop_iters   = 2,
+        max_loop_iters   = 4,
         n_routed_experts = 2,
         n_shared_experts = 1,
         expert_dim       = 256,
