@@ -1,0 +1,12 @@
+name: kashf
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - torch --index-url https://download.pytorch.org/whl/cpu
+      - transformers
+      - -e .
