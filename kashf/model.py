@@ -411,9 +411,6 @@ class KashfRecurrentBlock(nn.Module):
             cumulative_p = cumulative_p + p * still_running.float()
             halted = halted | (cumulative_p >= self.cfg.act_threshold)
 
-            if halted.all() and kv_cache is None:
-                break
-
         return h_out
 
 
