@@ -61,15 +61,17 @@ def pull_latest(gcs_prefix: str, cache_dir: str) -> str:
 
 def load_model(ckpt_path: str) -> tuple[KashfModel, KashfConfig, int]:
     print(f"Loading checkpoint: {ckpt_path} …", flush=True)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ckpt   = torch.load(ckpt_path, map_location=device, weights_only=False)
 
     cfg   = ckpt["cfg"]
     step  = int(ckpt["step"])
-    state = ckpt["model"]
 
     model = KashfModel(cfg)
-    model.load_state_dict(state)
-    model.eval().float()   # bfloat16 → float32 for CPU inference
+    model.load_state_dict(ckpt["model"])
+    # keep bfloat16 on GPU (native); cast to float32 on CPU (limited bfloat16 support)
+    model = model.to(device) if device == "cuda" else model.float()
+    model.eval()
     return model, cfg, step
 
 
@@ -110,9 +112,10 @@ def main():
     ckpt_path = args.ckpt or pull_latest(args.gcs, args.cache_dir)
     model, cfg, step = load_model(ckpt_path)
 
+    device   = next(model.parameters()).device
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nKashf  |  step {step:,}  |  {n_params/1e6:.1f}M params  |  "
-          f"loop_iters={cfg.max_loop_iters}  seq_len={cfg.max_seq_len}")
+          f"device={device}  loop_iters={cfg.max_loop_iters}  seq_len={cfg.max_seq_len}")
     print(f"temp={args.temperature}  top_k={args.top_k}  max_tokens={args.max_tokens}")
     print("─" * 60)
     print("Enter a prompt and press Enter to complete  (Ctrl-C to quit)\n")

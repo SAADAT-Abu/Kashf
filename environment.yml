@@ -7,6 +7,6 @@ dependencies:
   - python=3.10
   - pip
   - pip:
-      - torch --index-url https://download.pytorch.org/whl/cpu
+      - torch --index-url https://download.pytorch.org/whl/cu124
       - transformers
       - -e .
