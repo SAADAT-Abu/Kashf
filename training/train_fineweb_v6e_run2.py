@@ -47,7 +47,7 @@ LOG_EVERY    = 10
 CKPT_EVERY   = 100
 CKPT_DIR     = os.environ.get("KASHF_CKPT_DIR", "kashf_checkpoints_run2")
 GRAD_CLIP    = 1.0
-USE_GRAD_CKPT = True   # recompute activations in backward; essential at seq=4096, loops=6
+USE_GRAD_CKPT = False  # whole-model checkpoint doesn't work with XLA (input x has no grad)
 
 PREFILL_SEQS = 2000
 MAXBUF_SEQS  = 4000
