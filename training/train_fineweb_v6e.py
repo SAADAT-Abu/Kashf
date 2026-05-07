@@ -304,9 +304,9 @@ def _train_fn(index: int, cli_args):
                 logits.view(-1, vocab_size), y.view(-1)
             ) / GRAD_ACCUM
             loss.backward()
-
             with torch.no_grad():
                 step_loss = step_loss + loss.detach()
+            xm.mark_step()  # flush each micro-batch separately; keeps graph size small
 
         gnorm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         with torch.no_grad():
