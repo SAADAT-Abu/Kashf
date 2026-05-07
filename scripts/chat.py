@@ -85,7 +85,8 @@ def complete(
     temperature: float,
     top_k: int,
 ) -> str:
-    ids = tokenizer.encode(prompt, return_tensors="pt")
+    device = next(model.parameters()).device
+    ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     out = model.generate(
         ids,
         max_new_tokens=max_new_tokens,
