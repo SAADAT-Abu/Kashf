@@ -368,9 +368,7 @@ def main():
     print("Pre-caching GPT-2 tokenizer...")
     AutoTokenizer.from_pretrained("gpt2")
 
-    import torch_xla.runtime as xr
-    n = xr.addressable_device_count()
-    print(f"Spawning training across {n} TPU chips (nprocs=None, auto-detected)…")
+    print("Spawning training across all available TPU chips (nprocs=None, auto-detected)…")
     xmp.spawn(_train_fn, args=(None,), nprocs=None)
 
 
