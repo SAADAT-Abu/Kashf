@@ -1,33 +1,30 @@
 #!/usr/bin/env python3
 """
 Kashf — TPU v6e (Trillium) pretraining on FineWeb-Edu (HuggingFaceFW/fineweb-edu, sample-10BT).
-Single-process training via PJRT on v6e-8.
+PJRT training on v6e via xmp.spawn (gRPC child-process init).
 
     PJRT_DEVICE=TPU python training/train_fineweb_v6e.py
 
-Provision (v2-alpha-tpuv6e runtime required for PJRT):
+Provision (v2-alpha-tpuv6e runtime required):
     gcloud compute tpus tpu-vm create node-2 \
       --zone=europe-west4-a --project=kashf-494319 \
       --accelerator-type=v6e-8 --runtime-version=v2-alpha-tpuv6e
 
-Architecture note — v6e vs v4:
-  v4 used xmp.spawn (8 Python processes × 1 chip each, PJRT multi-process).
-  v6e with the v2-alpha-tpuv6e runtime uses single-process PJRT: one Python
-  process connects to the TPU gRPC runtime which serves all 8 chips.  xmp.spawn
-  is not supported in this runtime configuration.
+Architecture:
+  The v2-alpha-tpuv6e runtime serves TPU chips through a gRPC Docker container.
+  Direct PJRT init from the main process (xm.xla_device()) tries VFIO and fails.
+  xmp.spawn initialises PJRT inside spawned child processes which use the gRPC
+  path instead.  With TPU_PROCESS_BOUNDS=1,1,1 (default for this runtime) xmp.spawn
+  produces 1 child process whose xla:0 device represents all 8 chips via gRPC/SPMD.
+  Do NOT override TPU_PROCESS_BOUNDS — that breaks VFIO exclusion.
 
-  This script runs a single-process training loop.  The batch is scaled to
-  preserve the same global token throughput:
-    8 micro × 16 accum × 4096 = 524 288 tokens / step  (same as 8-chip v4/v6e)
+Data pipeline (PrefetchedDataset):
+  Background daemon thread downloads FineWeb-Edu and buffers tokenized int32 pairs
+  in a bounded queue.  Training reads via next_batch() — O(1) queue.get, no network
+  latency on the XLA critical path.  Auto-retries on HF errors.  Set HF_TOKEN env
+  var for authenticated downloads (higher rate limits).
 
-  Full 8-chip SPMD (mark_sharding across all chips from one process) is the
-  next optimization step; this script provides a working baseline first.
-
-Data pipeline:
-  PrefetchedDataset: background daemon thread streams HF data, tokenizes, and
-  buffers sequences in a bounded queue.  Training reads via next_batch()
-  (O(1) queue.get — no network latency on the critical path).  Auto-retries on
-  any HF connection error.  Set HF_TOKEN env var for higher rate limits.
+Batch:  8 micro × 16 accum × 4096 = 524 288 tokens/step (same as 8-chip v4 target)
 """
 
 import os
@@ -38,8 +35,10 @@ import threading
 import argparse
 import torch
 import torch.nn as nn
+
 import torch_xla
 import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
 
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -48,8 +47,8 @@ from kashf.model import KashfConfig, KashfModel
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 
 SEQ_LEN      = 4096
-MICRO_BATCH  = 8    # sequences per grad-accum sub-step
-GRAD_ACCUM   = 16   # 8 × 16 × 4096 = 524 288 tokens/step (same global batch as 8-chip run)
+MICRO_BATCH  = 8
+GRAD_ACCUM   = 16   # 8 × 16 × 4096 = 524 288 tokens/step
 
 LR           = 3e-4
 MIN_LR       = 3e-5
@@ -63,9 +62,9 @@ CKPT_DIR     = os.environ.get("KASHF_CKPT_DIR", "kashf_checkpoints")
 GRAD_CLIP    = 1.0
 USE_GRAD_CKPT = False
 
-# ── Data prefetch settings ────────────────────────────────────────────────────
-# Memory per chip: MAXBUF_SEQS × SEQ_LEN × 4 bytes (int32)
-# Default: 4000 × 4096 × 4 ≈ 64 MB
+# ── Data prefetch ─────────────────────────────────────────────────────────────
+# Memory: MAXBUF_SEQS × SEQ_LEN × 4 bytes (int32)
+# Default: 4000 × 4096 × 4 ≈ 64 MB — well within v6e VM RAM.
 # Raise PREFILL_SEQS for a larger head-start before training begins.
 PREFILL_SEQS = 2000   # sequences buffered before training starts
 MAXBUF_SEQS  = 4000   # hard cap on queue depth (backpressure)
@@ -78,25 +77,26 @@ class PrefetchedDataset:
     Streams HuggingFace FineWeb-Edu in a background daemon thread and buffers
     tokenized (x, y) int32 pairs in a bounded in-memory queue.
 
-    Training calls next_batch() — an O(1) queue.get() with no network latency
-    on the critical XLA path.  The download thread auto-retries on any
-    exception so transient HF drops do not crash training.
+    next_batch() is an O(1) queue.get() — no network latency on the XLA path.
+    The download thread auto-retries on any HF error without crashing training.
 
-    Use HF_TOKEN env var for authenticated requests (higher rate limits).
+    Supports HF_TOKEN env var for authenticated requests (higher rate limits).
+    Each instance is shard-aware: ordinal / world_size determines which slice of
+    the dataset this chip downloads.
     """
 
-    def __init__(self, tokenizer, seq_len: int):
+    def __init__(self, tokenizer, seq_len: int, ordinal: int, world_size: int):
         self._q       = queue.Queue(maxsize=MAXBUF_SEQS)
         self._ready   = threading.Event()
         self._seq_len = seq_len
         t = threading.Thread(
             target=self._worker,
-            args=(tokenizer, seq_len),
+            args=(tokenizer, seq_len, ordinal, world_size),
             daemon=True,
         )
         t.start()
 
-    def _worker(self, tokenizer, seq_len: int):
+    def _worker(self, tokenizer, seq_len: int, ordinal: int, world_size: int):
         hf_token = os.environ.get("HF_TOKEN")
         while True:
             try:
@@ -106,7 +106,8 @@ class PrefetchedDataset:
                     split="train",
                     streaming=True,
                     token=hf_token,
-                )
+                ).shard(num_shards=world_size, index=ordinal)
+
                 buf: list[int] = []
                 for sample in ds:
                     buf.extend(tokenizer.encode(sample["text"]))
@@ -118,17 +119,22 @@ class PrefetchedDataset:
                         self._q.put((x, y))          # blocks when buffer is full
                         if not self._ready.is_set() and self._q.qsize() >= PREFILL_SEQS:
                             self._ready.set()
-                print("  [data] dataset pass complete, restarting stream", flush=True)
+
+                print("  [data] dataset pass complete, restarting", flush=True)
+
             except Exception as exc:
                 print(f"  [data] error: {exc!r} — retrying in 10 s", flush=True)
                 time.sleep(10)
 
-    def wait_ready(self) -> None:
+    def wait_ready(self, mprint) -> None:
         if not self._ready.is_set():
             mb = PREFILL_SEQS * (self._seq_len + 1) * 4 / 1e6
-            print(f"  [data] pre-filling buffer — target {PREFILL_SEQS} seqs (~{mb:.0f} MB) …", flush=True)
+            mprint(
+                f"  [data] pre-filling buffer — target {PREFILL_SEQS} seqs "
+                f"(~{mb:.0f} MB) …"
+            )
             self._ready.wait()
-            print(f"  [data] buffer ready — {self._q.qsize()} seqs queued, starting training.", flush=True)
+            mprint(f"  [data] buffer ready — {self._q.qsize()} seqs queued.")
 
     def next_batch(self, micro_batch: int, device) -> tuple[torch.Tensor, torch.Tensor]:
         xs, ys = [], []
@@ -191,15 +197,27 @@ def load_checkpoint(model, optimizer, path: str) -> int:
     return int(ckpt["step"])
 
 
-# ── Training ──────────────────────────────────────────────────────────────────
+# ── Per-process training function ────────────────────────────────────────────
 
 
-def train():
-    device = xm.xla_device()
+def _train_fn(index: int, cli_args):
+    """
+    Spawned by xmp.spawn.  PJRT init happens inside this child process via gRPC
+    — do not call xm.xla_device() in main() before spawn (causes VFIO conflict).
+    """
+    device     = xm.xla_device()
+    ordinal    = xm.get_ordinal()
+    world_size = xm.xrt_world_size()
+    is_master  = xm.is_master_ordinal()
+
+    def mprint(*a, **kw):
+        if is_master:
+            print(*a, **kw, flush=True)
 
     tok        = AutoTokenizer.from_pretrained("gpt2")
-    vocab_size = tok.vocab_size   # 50257
+    vocab_size = tok.vocab_size
 
+    # ── Model ─────────────────────────────────────────────────────────────────
     cfg = KashfConfig(
         vocab_size       = vocab_size,
         dim              = 256,
@@ -216,40 +234,46 @@ def train():
     )
     model = KashfModel(cfg).to(torch.bfloat16).to(device)
 
-    counts = model.parameter_count()
-    print(f"Parameters : {counts['total']:,} total | {counts['unique (deduped)']:,} unique")
-    print(f"Device     : {device}  |  SEQ_LEN: {SEQ_LEN}  |  micro-batch: {MICRO_BATCH}  |  grad-accum: {GRAD_ACCUM}")
+    if is_master:
+        counts = model.parameter_count()
+        mprint(f"Parameters : {counts['total']:,} total | {counts['unique (deduped)']:,} unique")
+        mprint(f"Device     : {device}  |  world_size: {world_size}")
+        mprint(f"SEQ_LEN: {SEQ_LEN}  |  micro-batch: {MICRO_BATCH}  |  grad-accum: {GRAD_ACCUM}")
 
+    # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LR,
         weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95),
     )
 
-    # ── Resume from checkpoint ────────────────────────────────────────────────
+    # ── Resume ────────────────────────────────────────────────────────────────
     start_step = 0
     existing   = _list_ckpts(CKPT_DIR)
     if existing:
-        print(f"Resuming from {existing[-1]}")
+        mprint(f"Resuming from {existing[-1]}")
         start_step = load_checkpoint(model, optimizer, existing[-1])
         for state in optimizer.state.values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
-        print(f"Resumed at step {start_step}")
+        mprint(f"Resumed at step {start_step}")
 
     # ── Prefetched data pipeline ──────────────────────────────────────────────
-    dataset = PrefetchedDataset(tok, SEQ_LEN)
-    dataset.wait_ready()
+    dataset = PrefetchedDataset(tok, SEQ_LEN, ordinal, world_size)
+    dataset.wait_ready(mprint)
 
-    # ── Derived constants ─────────────────────────────────────────────────────
-    global_batch_tok = MICRO_BATCH * GRAD_ACCUM * SEQ_LEN
+    # ── Training constants ─────────────────────────────────────────────────────
+    global_batch_tok = MICRO_BATCH * world_size * GRAD_ACCUM * SEQ_LEN
     total_steps      = TARGET_TOKENS // global_batch_tok
 
-    print(f"\nDataset    : FineWeb-Edu sample-10BT")
-    print(f"Target     : {TARGET_TOKENS/1e9:.0f}B tokens  |  {total_steps:,} steps")
-    print(f"Global batch: {global_batch_tok:,} tokens/step\n")
-    print(f"{'step':>7}  {'loss':>7}  {'gnorm':>6}  {'lr':>8}  {'tok/s':>10}  {'tokens':>9}  {'buf':>5}")
-    print("-" * 72, flush=True)
+    mprint(f"\nDataset    : FineWeb-Edu sample-10BT")
+    mprint(f"Target     : {TARGET_TOKENS/1e9:.0f}B tokens  |  {total_steps:,} steps")
+    mprint(f"Global batch: {global_batch_tok:,} tokens/step\n")
+    mprint(
+        f"{'step':>7}  {'loss':>7}  {'gnorm':>6}  {'lr':>8}"
+        f"  {'tok/s':>10}  {'tokens':>9}  {'buf':>5}"
+    )
+    mprint("-" * 72)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     model.train()
@@ -298,23 +322,24 @@ def train():
             tokens_seen = step * global_batch_tok
             cur_lr      = get_lr(step, total_steps)
             buf         = dataset.buf_depth()
-            print(
+            mprint(
                 f"{step:7d}  {step_loss.item():7.4f}  {step_gnorm.item():6.3f}"
                 f"  {cur_lr:.2e}  {tok_per_sec:10,.0f}  {tokens_seen/1e9:7.2f}B"
-                f"  {buf:5d}",
-                flush=True,
+                f"  {buf:5d}"
             )
             t0 = time.perf_counter()
 
         if step % CKPT_EVERY == 0:
             xm.mark_step()
-            save_checkpoint(model, optimizer, step, cfg, CKPT_DIR)
+            if is_master:
+                save_checkpoint(model, optimizer, step, cfg, CKPT_DIR)
 
     if step > start_step and step % CKPT_EVERY != 0:
         xm.mark_step()
-        save_checkpoint(model, optimizer, step, cfg, CKPT_DIR)
+        if is_master:
+            save_checkpoint(model, optimizer, step, cfg, CKPT_DIR)
 
-    print("\nTraining complete.")
+    mprint("\nTraining complete.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -322,10 +347,12 @@ def train():
 
 def main():
     argparse.ArgumentParser(description="Kashf v6e training on FineWeb-Edu").parse_args()
+    # Pre-cache tokenizer BEFORE spawn — avoids every child process racing to download.
+    # Do NOT call xm.xla_device() here — that triggers VFIO mode and crashes.
     print("Pre-caching GPT-2 tokenizer...")
     AutoTokenizer.from_pretrained("gpt2")
-    print(f"Starting single-process v6e training (PJRT, {xm.xla_device()})…")
-    train()
+    print("Spawning via xmp.spawn (nprocs=None, PJRT gRPC child-process init)…")
+    xmp.spawn(_train_fn, args=(None,), nprocs=None)
 
 
 if __name__ == "__main__":
