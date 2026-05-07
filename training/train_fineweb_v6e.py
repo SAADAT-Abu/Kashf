@@ -46,9 +46,9 @@ from kashf.model import KashfConfig, KashfModel
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 
-SEQ_LEN      = 4096
+SEQ_LEN      = 2048
 MICRO_BATCH  = 8
-GRAD_ACCUM   = 16   # 8 × 16 × 4096 = 524 288 tokens/step
+GRAD_ACCUM   = 32   # 8 × 32 × 2048 = 524 288 tokens/step (same global batch)
 
 LR           = 3e-4
 MIN_LR       = 3e-5
@@ -64,7 +64,7 @@ USE_GRAD_CKPT = False
 
 # ── Data prefetch ─────────────────────────────────────────────────────────────
 # Memory: MAXBUF_SEQS × SEQ_LEN × 4 bytes (int32)
-# Default: 4000 × 4096 × 4 ≈ 64 MB — well within v6e VM RAM.
+# Default: 4000 × 2048 × 4 ≈ 32 MB — well within v6e VM RAM.
 # Raise PREFILL_SEQS for a larger head-start before training begins.
 PREFILL_SEQS = 2000   # sequences buffered before training starts
 MAXBUF_SEQS  = 4000   # hard cap on queue depth (backpressure)
