@@ -46,7 +46,7 @@ echo ">>> LD_LIBRARY_PATH hook written."
 echo ">>> Installing torch 2.6.0+cpu and torch_xla 2.6.0+libtpu..."
 "$PIP" install --upgrade pip --quiet
 "$PIP" install torch==2.6.0+cpu --index-url https://download.pytorch.org/whl/cpu --quiet
-"$PIP" install "https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.6.0-cp310-cp310-linux_x86_64.whl" --quiet
+"$PIP" install "https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-2.6.0+libtpu-cp310-cp310-manylinux_2_28_x86_64.whl" --quiet
 
 # ── 5. datasets + transformers ────────────────────────────────────────────────
 echo ">>> Installing datasets and transformers..."

@@ -254,8 +254,8 @@ def _train_fn(index: int, cli_args):
             x, y = dataset.next_batch(MICRO_BATCH, device)
 
             if USE_GRAD_CKPT:
-                from torch.utils.checkpoint import checkpoint as grad_ckpt
-                logits = grad_ckpt(model, x, use_reentrant=True)
+                from torch_xla.utils.checkpoint import checkpoint as grad_ckpt
+                logits = grad_ckpt(model, x)
             else:
                 logits = model(x)
 
