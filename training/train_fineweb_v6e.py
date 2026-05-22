@@ -5,36 +5,27 @@ PJRT training on v6e via xmp.spawn (gRPC child-process init).
 
     PJRT_DEVICE=TPU python training/train_fineweb_v6e.py
 
-Provision (v2-alpha-tpuv6e runtime required):
-    gcloud compute tpus tpu-vm create node-2 \
-      --zone=europe-west4-a --project=kashf-494319 \
-      --accelerator-type=v6e-8 --runtime-version=v2-alpha-tpuv6e
-
 Architecture:
   The v2-alpha-tpuv6e runtime serves TPU chips through a gRPC Docker container.
-  Direct PJRT init from the main process (xm.xla_device()) tries VFIO and fails.
   xmp.spawn initialises PJRT inside spawned child processes which use the gRPC
-  path instead.  With TPU_PROCESS_BOUNDS=1,1,1 (default for this runtime) xmp.spawn
-  produces 1 child process whose xla:0 device represents all 8 chips via gRPC/SPMD.
-  Do NOT override TPU_PROCESS_BOUNDS — that breaks VFIO exclusion.
+  path instead of VFIO.  Do NOT call xm.xla_device() in main().
 
-Data pipeline (PrefetchedDataset):
-  Background daemon thread downloads FineWeb-Edu and buffers tokenized int32 pairs
-  in a bounded queue.  Training reads via next_batch() — O(1) queue.get, no network
-  latency on the XLA critical path.  Auto-retries on HF errors.  Set HF_TOKEN env
-  var for authenticated downloads (higher rate limits).
+Data pipeline (ChunkedDiskDataset):
+  Downloads FineWeb-Edu in large chunks (~400M tokens) to a local binary file,
+  trains through the file via numpy memmap, then deletes it and downloads the
+  next chunk.  A background thread pre-fetches the next chunk while training
+  runs on the current one — the XLA compute path never blocks on the network.
+  Chunk file size: ~1.6 GB (400M × int32).  Disk usage: ≤2 chunks at a time.
 
 Batch:  8 micro × 32 accum × 2048 = 524 288 tokens/step
-Run-2 changes vs run-1: TARGET_TOKENS 10B→50B, max_loop_iters 2→4,
-WARMUP_STEPS 500→1000, load_checkpoint handles LoopGate size mismatch.
 """
 
 import os
 import math
 import time
-import queue
 import threading
 import argparse
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -50,7 +41,7 @@ from kashf.model import KashfConfig, KashfModel
 
 SEQ_LEN      = 2048
 MICRO_BATCH  = 8
-GRAD_ACCUM   = 32   # 8 × 32 × 2048 = 524 288 tokens/step (same global batch)
+GRAD_ACCUM   = 32   # 8 × 32 × 2048 = 524 288 tokens/step
 
 LR           = 3e-4
 MIN_LR       = 3e-5
@@ -62,43 +53,74 @@ LOG_EVERY    = 10
 CKPT_EVERY   = 500
 CKPT_DIR     = os.environ.get("KASHF_CKPT_DIR", "kashf_checkpoints")
 GRAD_CLIP    = 1.0
-USE_GRAD_CKPT = False
 
-# ── Data prefetch ─────────────────────────────────────────────────────────────
-# Memory: MAXBUF_SEQS × SEQ_LEN × 4 bytes (int32)
-# Default: 4000 × 2048 × 4 ≈ 32 MB — well within v6e VM RAM.
-# Raise PREFILL_SEQS for a larger head-start before training begins.
-PREFILL_SEQS = 2000   # sequences buffered before training starts
-MAXBUF_SEQS  = 4000   # hard cap on queue depth (backpressure)
+# ── Chunked disk dataset ──────────────────────────────────────────────────────
+# Each chunk: 400M tokens × 4 bytes (int32) ≈ 1.6 GB on disk.
+# At 107K tok/s: provides ~45 min of training before the next chunk is needed.
+# Max disk usage: 2 chunks concurrently (current + prefetch) = ~3.2 GB.
+CHUNK_TOKENS = 400_000_000
+CHUNK_DIR    = os.path.join(os.path.expanduser("~"), "kashf_data_cache")
 
 
-# ── Prefetched dataset ────────────────────────────────────────────────────────
-
-class PrefetchedDataset:
+class ChunkedDiskDataset:
     """
-    Streams HuggingFace FineWeb-Edu in a background daemon thread and buffers
-    tokenized (x, y) int32 pairs in a bounded in-memory queue.
+    Downloads FineWeb-Edu via HuggingFace streaming, accumulates CHUNK_TOKENS
+    tokens into a flat int32 binary file, then serves next_batch() directly
+    from a numpy memmap (no live network calls on the XLA path).
 
-    next_batch() is an O(1) queue.get() — no network latency on the XLA path.
-    The download thread auto-retries on any HF error without crashing training.
+    When the current chunk is exhausted:
+      1. Waits for the pre-fetched next chunk (background thread).
+      2. Deletes the old file.
+      3. Starts pre-fetching the following chunk in the background.
 
-    Supports HF_TOKEN env var for authenticated requests (higher rate limits).
-    Each instance is shard-aware: ordinal / world_size determines which slice of
-    the dataset this chip downloads.
+    Training never stalls: the background download of ~1.6 GB typically
+    completes in < 60 s, well within the ~45 min the current chunk lasts.
     """
 
     def __init__(self, tokenizer, seq_len: int, ordinal: int, world_size: int):
-        self._q       = queue.Queue(maxsize=MAXBUF_SEQS)
-        self._ready   = threading.Event()
-        self._seq_len = seq_len
-        t = threading.Thread(
-            target=self._worker,
-            args=(tokenizer, seq_len, ordinal, world_size),
-            daemon=True,
-        )
-        t.start()
+        self.tok        = tokenizer
+        self.seq_len    = seq_len
+        self.ordinal    = ordinal
+        self.world_size = world_size
 
-    def _worker(self, tokenizer, seq_len: int, ordinal: int, world_size: int):
+        os.makedirs(CHUNK_DIR, exist_ok=True)
+
+        self._stream     = self._make_stream()
+        self._mmap       = None
+        self._mmap_path  = None
+        self._pos        = 0
+        self._next_mmap  = None
+        self._next_path  = None
+        self._next_ready = threading.Event()
+
+    # ── public ────────────────────────────────────────────────────────────────
+
+    def build_first_chunk(self, mprint) -> None:
+        """Build the initial chunk synchronously (called before training starts)."""
+        mprint(f"  [data] downloading first chunk ({CHUNK_TOKENS // 1_000_000}M tokens) …")
+        self._mmap, self._mmap_path = self._build_chunk()
+        mprint(f"  [data] chunk ready — {len(self._mmap):,} tokens on disk.")
+        self._launch_prefetch()
+
+    def next_batch(self, micro_batch: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        needed = micro_batch * (self.seq_len + 1)
+
+        if self._pos + needed > len(self._mmap):
+            self._swap_chunk()
+
+        raw = np.array(self._mmap[self._pos: self._pos + needed], dtype=np.int64)
+        self._pos += needed
+
+        ids = torch.from_numpy(raw).view(micro_batch, self.seq_len + 1)
+        return ids[:, :-1].to(device), ids[:, 1:].to(device)
+
+    def buf_depth(self) -> int:
+        remaining = max(0, len(self._mmap) - self._pos) // (self.seq_len + 1)
+        return min(remaining, 99_999)
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _make_stream(self):
         hf_token = os.environ.get("HF_TOKEN")
         while True:
             try:
@@ -108,49 +130,56 @@ class PrefetchedDataset:
                     split="train",
                     streaming=True,
                     token=hf_token,
-                ).shard(num_shards=world_size, index=ordinal)
-
-                buf: list[int] = []
+                ).shard(num_shards=self.world_size, index=self.ordinal)
                 for sample in ds:
-                    buf.extend(tokenizer.encode(sample["text"]))
-                    while len(buf) >= seq_len + 1:
-                        chunk = buf[: seq_len + 1]
-                        buf   = buf[seq_len + 1 :]
-                        x = torch.tensor(chunk[:-1], dtype=torch.int32)
-                        y = torch.tensor(chunk[1:],  dtype=torch.int32)
-                        self._q.put((x, y))          # blocks when buffer is full
-                        if not self._ready.is_set() and self._q.qsize() >= PREFILL_SEQS:
-                            self._ready.set()
-
-                print("  [data] dataset pass complete, restarting", flush=True)
-
+                    yield sample["text"]
+                # dataset exhausted — loop back for multi-epoch
             except Exception as exc:
-                print(f"  [data] error: {exc!r} — retrying in 10 s", flush=True)
+                print(f"  [data] stream error: {exc!r} — retrying in 10 s", flush=True)
                 time.sleep(10)
 
-    def wait_ready(self, mprint) -> None:
-        if not self._ready.is_set():
-            mb = PREFILL_SEQS * (self._seq_len + 1) * 4 / 1e6
-            mprint(
-                f"  [data] pre-filling buffer — target {PREFILL_SEQS} seqs "
-                f"(~{mb:.0f} MB) …"
-            )
-            self._ready.wait()
-            mprint(f"  [data] buffer ready — {self._q.qsize()} seqs queued.")
+    def _build_chunk(self) -> tuple[np.memmap, str]:
+        path  = os.path.join(CHUNK_DIR, f"chunk_{os.getpid()}_{time.monotonic_ns()}.bin")
+        total = 0
+        with open(path, "wb") as f:
+            for text in self._stream:
+                ids = self.tok.encode(text)
+                if ids:
+                    np.array(ids, dtype=np.int32).tofile(f)
+                    total += len(ids)
+                if total >= CHUNK_TOKENS:
+                    break
+        return np.memmap(path, dtype=np.int32, mode="r"), path
 
-    def next_batch(self, micro_batch: int, device) -> tuple[torch.Tensor, torch.Tensor]:
-        xs, ys = [], []
-        for _ in range(micro_batch):
-            x, y = self._q.get()
-            xs.append(x)
-            ys.append(y)
-        return (
-            torch.stack(xs).long().to(device),
-            torch.stack(ys).long().to(device),
-        )
+    def _launch_prefetch(self) -> None:
+        self._next_ready.clear()
 
-    def buf_depth(self) -> int:
-        return self._q.qsize()
+        def _worker():
+            buf, path = self._build_chunk()
+            self._next_mmap = buf
+            self._next_path = path
+            self._next_ready.set()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _swap_chunk(self) -> None:
+        self._next_ready.wait()
+
+        # Release and delete the old chunk
+        if self._mmap is not None:
+            del self._mmap
+        if self._mmap_path and os.path.exists(self._mmap_path):
+            try:
+                os.remove(self._mmap_path)
+            except OSError:
+                pass
+
+        self._mmap      = self._next_mmap
+        self._mmap_path = self._next_path
+        self._pos       = 0
+        self._next_mmap = None
+        self._next_path = None
+        self._launch_prefetch()
 
 
 # ── LR schedule ──────────────────────────────────────────────────────────────
@@ -195,17 +224,35 @@ def save_checkpoint(model, optimizer, step: int, cfg, ckpt_dir: str, keep_last: 
 def load_checkpoint(model, optimizer, path: str) -> int:
     ckpt  = torch.load(path, map_location="cpu", weights_only=False)
     state = ckpt["model"]
-    # LoopGate is nn.Embedding(max_loop_iters, 1); pad if checkpoint has fewer iters.
-    # New rows initialised to 1.0, matching nn.init.ones_ in LoopGate.__init__.
+
+    # Pad LoopGate embedding when resuming from a checkpoint with fewer
+    # loop iterations. New rows init to 1.0 (matches nn.init.ones_).
     key = "recurrent.loop_gate.gate.weight"
     if key in state:
-        saved        = state[key]
-        target_size  = model.recurrent.loop_gate.gate.weight.shape[0]
+        saved       = state[key]
+        target_size = model.recurrent.loop_gate.gate.weight.shape[0]
         if saved.shape[0] < target_size:
-            pad       = torch.ones(target_size - saved.shape[0], 1, dtype=saved.dtype)
+            pad        = torch.ones(target_size - saved.shape[0], 1, dtype=saved.dtype)
             state[key] = torch.cat([saved, pad], dim=0)
+
     model.load_state_dict(state)
-    optimizer.load_state_dict(ckpt["optimizer"])
+
+    # Load optimizer moments; drop any entry whose shape no longer matches
+    # (e.g. LoopGate after increasing max_loop_iters). AdamW reinitialises
+    # missing entries on the first step — no training correctness issue.
+    opt_sd       = ckpt["optimizer"]
+    model_params = list(model.parameters())
+    stale        = []
+    for pid, pstate in opt_sd["state"].items():
+        for val in pstate.values():
+            if isinstance(val, torch.Tensor) and pid < len(model_params):
+                if val.shape != model_params[pid].shape:
+                    stale.append(pid)
+                    break
+    for pid in stale:
+        del opt_sd["state"][pid]
+
+    optimizer.load_state_dict(opt_sd)
     return int(ckpt["step"])
 
 
@@ -213,10 +260,6 @@ def load_checkpoint(model, optimizer, path: str) -> int:
 
 
 def _train_fn(index: int, cli_args):
-    """
-    Spawned by xmp.spawn.  PJRT init happens inside this child process via gRPC
-    — do not call xm.xla_device() in main() before spawn (causes VFIO conflict).
-    """
     device     = xm.xla_device()
     ordinal    = xm.get_ordinal()
     world_size = xm.xrt_world_size()
@@ -229,7 +272,6 @@ def _train_fn(index: int, cli_args):
     tok        = AutoTokenizer.from_pretrained("gpt2")
     vocab_size = tok.vocab_size
 
-    # ── Model ─────────────────────────────────────────────────────────────────
     cfg = KashfConfig(
         vocab_size       = vocab_size,
         dim              = 256,
@@ -251,8 +293,8 @@ def _train_fn(index: int, cli_args):
         mprint(f"Parameters : {counts['total']:,} total | {counts['unique (deduped)']:,} unique")
         mprint(f"Device     : {device}  |  world_size: {world_size}")
         mprint(f"SEQ_LEN: {SEQ_LEN}  |  micro-batch: {MICRO_BATCH}  |  grad-accum: {GRAD_ACCUM}")
+        mprint(f"max_loop_iters: 4  |  target: {TARGET_TOKENS/1e9:.0f}B tokens")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LR,
         weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95),
@@ -264,17 +306,17 @@ def _train_fn(index: int, cli_args):
     if existing:
         mprint(f"Resuming from {existing[-1]}")
         start_step = load_checkpoint(model, optimizer, existing[-1])
-        for state in optimizer.state.values():
-            for k, v in state.items():
+        for pstate in optimizer.state.values():
+            for k, v in pstate.items():
                 if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
+                    pstate[k] = v.to(device)
         mprint(f"Resumed at step {start_step}")
 
-    # ── Prefetched data pipeline ──────────────────────────────────────────────
-    dataset = PrefetchedDataset(tok, SEQ_LEN, ordinal, world_size)
-    dataset.wait_ready(mprint)
+    # ── Data pipeline ─────────────────────────────────────────────────────────
+    dataset = ChunkedDiskDataset(tok, SEQ_LEN, ordinal, world_size)
+    dataset.build_first_chunk(mprint)
 
-    # ── Training constants ─────────────────────────────────────────────────────
+    # ── Training constants ────────────────────────────────────────────────────
     global_batch_tok = MICRO_BATCH * world_size * GRAD_ACCUM * SEQ_LEN
     total_steps      = TARGET_TOKENS // global_batch_tok
 
@@ -283,7 +325,7 @@ def _train_fn(index: int, cli_args):
     mprint(f"Global batch: {global_batch_tok:,} tokens/step\n")
     mprint(
         f"{'step':>7}  {'loss':>7}  {'gnorm':>6}  {'lr':>8}"
-        f"  {'tok/s':>10}  {'tokens':>9}  {'buf':>5}"
+        f"  {'tok/s':>10}  {'tokens':>9}  {'buf':>8}"
     )
     mprint("-" * 72)
 
@@ -305,20 +347,14 @@ def _train_fn(index: int, cli_args):
 
         for _ in range(GRAD_ACCUM):
             x, y = dataset.next_batch(MICRO_BATCH, device)
-
-            if USE_GRAD_CKPT:
-                from torch.utils.checkpoint import checkpoint as grad_ckpt
-                logits = grad_ckpt(model, x, use_reentrant=True)
-            else:
-                logits = model(x)
-
-            loss = nn.functional.cross_entropy(
+            logits = model(x)
+            loss   = nn.functional.cross_entropy(
                 logits.view(-1, vocab_size), y.view(-1)
             ) / GRAD_ACCUM
             loss.backward()
             with torch.no_grad():
                 step_loss = step_loss + loss.detach()
-            xm.mark_step()  # flush each micro-batch separately; keeps graph size small
+            xm.mark_step()
 
         gnorm = nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         with torch.no_grad():
@@ -337,7 +373,7 @@ def _train_fn(index: int, cli_args):
             mprint(
                 f"{step:7d}  {step_loss.item():7.4f}  {step_gnorm.item():6.3f}"
                 f"  {cur_lr:.2e}  {tok_per_sec:10,.0f}  {tokens_seen/1e9:7.2f}B"
-                f"  {buf:5d}"
+                f"  {buf:8,}"
             )
             t0 = time.perf_counter()
 
@@ -359,8 +395,6 @@ def _train_fn(index: int, cli_args):
 
 def main():
     argparse.ArgumentParser(description="Kashf v6e training on FineWeb-Edu").parse_args()
-    # Pre-cache tokenizer BEFORE spawn — avoids every child process racing to download.
-    # Do NOT call xm.xla_device() here — that triggers VFIO mode and crashes.
     print("Pre-caching GPT-2 tokenizer...")
     AutoTokenizer.from_pretrained("gpt2")
     print("Spawning via xmp.spawn (nprocs=None, PJRT gRPC child-process init)…")
