@@ -46,6 +46,7 @@ class KashfConfig:
     act_threshold: float = 0.99     # ACT halting threshold
     rope_theta: float = 500000.0    # RoPE base frequency
     dropout: float = 0.0
+    lm_head_dim: Optional[int] = None  # None → direct dim→vocab; int → factored dim→lm_head_dim→vocab
 
 
 # ---------------------------------------------------------------------------
@@ -451,7 +452,12 @@ class KashfModel(nn.Module):
 
         self.recurrent = KashfRecurrentBlock(cfg)
         self.norm      = RMSNorm(cfg.dim)
-        self.head      = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        if cfg.lm_head_dim is not None:
+            self.head_pre = nn.Linear(cfg.dim, cfg.lm_head_dim, bias=False)
+            self.head     = nn.Linear(cfg.lm_head_dim, cfg.vocab_size, bias=False)
+        else:
+            self.head_pre = None
+            self.head     = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
 
         self._init_weights()
 
@@ -487,7 +493,10 @@ class KashfModel(nn.Module):
         x = self.recurrent(x, e, freqs_cis, mask, n_loops, kv_cache)
         x = self.coda_block(x, freqs_cis, mask, kv_cache, "coda")
 
-        return self.head(self.norm(x))
+        h = self.norm(x)
+        if self.head_pre is not None:
+            h = self.head_pre(h)
+        return self.head(h)
 
     @torch.no_grad()
     def generate(

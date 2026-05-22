@@ -285,6 +285,7 @@ def _train_fn(index: int, cli_args):
         expert_dim       = 256,
         act_threshold    = 0.99,
         rope_theta       = 500_000.0,
+        lm_head_dim      = 64,
     )
     model = KashfModel(cfg).to(torch.bfloat16).to(device)
 
@@ -293,7 +294,7 @@ def _train_fn(index: int, cli_args):
         mprint(f"Parameters : {counts['total']:,} total | {counts['unique (deduped)']:,} unique")
         mprint(f"Device     : {device}  |  world_size: {world_size}")
         mprint(f"SEQ_LEN: {SEQ_LEN}  |  micro-batch: {MICRO_BATCH}  |  grad-accum: {GRAD_ACCUM}")
-        mprint(f"max_loop_iters: 4  |  target: {TARGET_TOKENS/1e9:.0f}B tokens")
+        mprint(f"max_loop_iters: 4  |  lm_head_dim: 64  |  target: {TARGET_TOKENS/1e9:.0f}B tokens")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LR,

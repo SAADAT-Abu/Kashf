@@ -73,7 +73,7 @@ add_if_missing() {
 }
 add_if_missing "source $CONDA_DIR/bin/activate $ENV_NAME"
 add_if_missing "export PJRT_DEVICE=TPU"
-add_if_missing "export KASHF_CKPT_DIR=/home/\$USER/kashf_checkpoints_run2"
+add_if_missing "export KASHF_CKPT_DIR=/home/\$USER/kashf_checkpoints"
 echo ">>> .bashrc updated."
 
 # ── 9. Checkpoint directories ────────────────────────────────────────────────
