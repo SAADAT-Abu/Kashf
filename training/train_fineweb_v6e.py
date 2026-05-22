@@ -24,7 +24,9 @@ Data pipeline (PrefetchedDataset):
   latency on the XLA critical path.  Auto-retries on HF errors.  Set HF_TOKEN env
   var for authenticated downloads (higher rate limits).
 
-Batch:  8 micro × 16 accum × 4096 = 524 288 tokens/step (same as 8-chip v4 target)
+Batch:  8 micro × 32 accum × 2048 = 524 288 tokens/step
+Run-2 changes vs run-1: TARGET_TOKENS 10B→50B, max_loop_iters 2→4,
+WARMUP_STEPS 500→1000, load_checkpoint handles LoopGate size mismatch.
 """
 
 import os
@@ -53,8 +55,8 @@ GRAD_ACCUM   = 32   # 8 × 32 × 2048 = 524 288 tokens/step (same global batch)
 LR           = 3e-4
 MIN_LR       = 3e-5
 WEIGHT_DECAY = 0.1
-WARMUP_STEPS = 500
-TARGET_TOKENS = 10_000_000_000
+WARMUP_STEPS = 1000
+TARGET_TOKENS = 50_000_000_000
 
 LOG_EVERY    = 10
 CKPT_EVERY   = 500
@@ -191,8 +193,18 @@ def save_checkpoint(model, optimizer, step: int, cfg, ckpt_dir: str, keep_last: 
 
 
 def load_checkpoint(model, optimizer, path: str) -> int:
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    ckpt  = torch.load(path, map_location="cpu", weights_only=False)
+    state = ckpt["model"]
+    # LoopGate is nn.Embedding(max_loop_iters, 1); pad if checkpoint has fewer iters.
+    # New rows initialised to 1.0, matching nn.init.ones_ in LoopGate.__init__.
+    key = "recurrent.loop_gate.gate.weight"
+    if key in state:
+        saved        = state[key]
+        target_size  = model.recurrent.loop_gate.gate.weight.shape[0]
+        if saved.shape[0] < target_size:
+            pad       = torch.ones(target_size - saved.shape[0], 1, dtype=saved.dtype)
+            state[key] = torch.cat([saved, pad], dim=0)
+    model.load_state_dict(state)
     optimizer.load_state_dict(ckpt["optimizer"])
     return int(ckpt["step"])
 
@@ -225,7 +237,7 @@ def _train_fn(index: int, cli_args):
         n_heads          = 4,
         head_dim         = 64,
         max_seq_len      = SEQ_LEN,
-        max_loop_iters   = 2,
+        max_loop_iters   = 4,
         n_routed_experts = 2,
         n_shared_experts = 1,
         expert_dim       = 256,

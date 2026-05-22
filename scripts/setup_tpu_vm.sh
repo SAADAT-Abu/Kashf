@@ -76,11 +76,19 @@ add_if_missing "export PJRT_DEVICE=TPU"
 add_if_missing "export KASHF_CKPT_DIR=/home/\$USER/kashf_checkpoints_run2"
 echo ">>> .bashrc updated."
 
-# ── 9. Checkpoint directory ───────────────────────────────────────────────────
+# ── 9. Checkpoint directories ────────────────────────────────────────────────
+mkdir -p "$HOME/kashf_checkpoints"
 mkdir -p "$HOME/kashf_checkpoints_run2"
-echo ">>> Checkpoint dir: $HOME/kashf_checkpoints_run2"
+echo ">>> Checkpoint dirs created."
 
-# ── 10. Verify ────────────────────────────────────────────────────────────────
+# ── 10. Fix GCS write auth (override GCE read-only service account scope) ────
+cat > "$HOME/.boto" <<'EOF'
+[GoogleCompute]
+service_account =
+EOF
+echo ">>> GCS write auth fixed (~/.boto service_account cleared)."
+
+# ── 11. Verify ────────────────────────────────────────────────────────────────
 echo ""
 echo ">>> Verifying install..."
 "$CONDA_DIR/envs/$ENV_NAME/bin/python" - <<'PYEOF'
@@ -92,10 +100,10 @@ PYEOF
 
 echo ""
 echo "=== Setup complete ==="
-echo "To start training, run:"
+echo "To start training (run-1 on node-2), run:"
 echo "  source ~/miniconda3/bin/activate kashf"
 echo "  export PJRT_DEVICE=TPU"
-echo "  export KASHF_CKPT_DIR=\$HOME/kashf_checkpoints_run2"
+echo "  export KASHF_CKPT_DIR=\$HOME/kashf_checkpoints"
 echo "  set -a; source /home/tpu-runtime/tpu-env; set +a"
 echo "  cd ~/kashf"
-echo "  python training/train_fineweb_v6e_run2.py 2>&1 | tee ~/training_run2.log"
+echo "  python training/train_fineweb_v6e.py 2>&1 | tee ~/training.log"
