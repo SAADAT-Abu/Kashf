@@ -278,10 +278,11 @@ class MicroMoEFFN(nn.Module):
 
         out = torch.zeros_like(flat)
         for eid in range(self.n_routed_experts):
-            w    = ste_weights[:, eid]
-            mask = w > 0.5
-            if mask.any():
-                out[mask] = out[mask] + w[mask].unsqueeze(1) * self.routed_experts[eid](flat[mask])
+            # Use masked multiplication instead of boolean indexing.
+            # `if mask.any()` forces an XLA CPU sync + data-dependent branch → recompiles every step.
+            # Dense multiplication is zero-cost for unselected tokens and XLA-static.
+            expert_out = self.routed_experts[eid](flat)
+            out = out + ste_weights[:, eid].unsqueeze(1) * expert_out
 
         out = out + self.shared_expert(flat)
         return out.view(B, T, D)
