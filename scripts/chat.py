@@ -19,7 +19,11 @@ from transformers import AutoTokenizer
 
 from kashf.model import KashfConfig, KashfModel
 
-GCS_PREFIX = "gs://kashf-checkpoints-eu/fineweb-v6e-run1"
+GCS_RUNS = {
+    "run1": "gs://kashf-checkpoints-eu/fineweb-v6e-run1",
+    "run2": "gs://kashf-checkpoints-eu/fineweb-v6e-run2",
+}
+GCS_PREFIX = GCS_RUNS["run2"]   # default: latest run
 LOCAL_CACHE = os.path.expanduser("~/.cache/kashf_checkpoints")
 
 
@@ -84,6 +88,7 @@ def complete(
     max_new_tokens: int,
     temperature: float,
     top_k: int,
+    repetition_penalty: float = 1.3,
 ) -> str:
     device = next(model.parameters()).device
     ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -93,6 +98,7 @@ def complete(
         n_loops=model.cfg.max_loop_iters,
         temperature=temperature,
         top_k=top_k,
+        repetition_penalty=repetition_penalty,
     )
     new_ids = out[0, ids.shape[1]:]
     return tokenizer.decode(new_ids.tolist(), skip_special_tokens=True)
@@ -103,14 +109,17 @@ def complete(
 def main():
     parser = argparse.ArgumentParser(description="Chat with a local Kashf checkpoint")
     parser.add_argument("--ckpt",        default=None,     help="Local .pt path (skips GCS download)")
+    parser.add_argument("--run",         default=None,     choices=list(GCS_RUNS), help="Which training run to pull from GCS (default: run2)")
     parser.add_argument("--gcs",         default=GCS_PREFIX)
     parser.add_argument("--cache-dir",   default=LOCAL_CACHE)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top-k",       type=int,   default=50)
-    parser.add_argument("--max-tokens",  type=int,   default=200)
+    parser.add_argument("--temperature",        type=float, default=0.8)
+    parser.add_argument("--top-k",             type=int,   default=50)
+    parser.add_argument("--max-tokens",        type=int,   default=200)
+    parser.add_argument("--repetition-penalty",type=float, default=1.3)
     args = parser.parse_args()
 
-    ckpt_path = args.ckpt or pull_latest(args.gcs, args.cache_dir)
+    gcs = GCS_RUNS.get(args.run, args.gcs) if args.run else args.gcs
+    ckpt_path = args.ckpt or pull_latest(gcs, args.cache_dir)
     model, cfg, step = load_model(ckpt_path)
 
     device   = next(model.parameters()).device
@@ -137,7 +146,8 @@ def main():
             output = complete(model, tok, prompt,
                               max_new_tokens=args.max_tokens,
                               temperature=args.temperature,
-                              top_k=args.top_k)
+                              top_k=args.top_k,
+                              repetition_penalty=args.repetition_penalty)
             print(output)
             print()
         except Exception as exc:

@@ -506,8 +506,9 @@ class KashfModel(nn.Module):
         n_loops: int = 6,
         temperature: float = 1.0,
         top_k: int = 50,
+        repetition_penalty: float = 1.3,
     ) -> torch.Tensor:
-        """Autoregressive generation with KV caching."""
+        """Autoregressive generation with KV caching and repetition penalty."""
         kv_cache: dict = {}
         prompt_len = input_ids.shape[1]
 
@@ -515,8 +516,17 @@ class KashfModel(nn.Module):
             cur_ids   = input_ids if step == 0 else input_ids[:, -1:]
             start_pos = 0 if step == 0 else prompt_len + step - 1
             logits    = self.forward(cur_ids, n_loops=n_loops, kv_cache=kv_cache, start_pos=start_pos)
-            logits    = logits[:, -1, :] / temperature
+            logits    = logits[:, -1, :]
 
+            if repetition_penalty != 1.0:
+                for b in range(input_ids.shape[0]):
+                    for token_id in input_ids[b].tolist():
+                        if logits[b, token_id] > 0:
+                            logits[b, token_id] /= repetition_penalty
+                        else:
+                            logits[b, token_id] *= repetition_penalty
+
+            logits = logits / temperature
             if top_k > 0:
                 v, _ = logits.topk(top_k)
                 logits[logits < v[:, -1:]] = float("-inf")

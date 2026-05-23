@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Kashf — TPU v6e (Trillium) pretraining on FineWeb-Edu (HuggingFaceFW/fineweb-edu, sample-10BT).
+Kashf v2 — TPU v6e (Trillium) pretraining on FineWeb-Edu, 50B tokens.
 PJRT training on v6e via xmp.spawn (gRPC child-process init).
 
     PJRT_DEVICE=TPU python training/train_fineweb_v6e.py
 
-Architecture:
-  The v2-alpha-tpuv6e runtime serves TPU chips through a gRPC Docker container.
-  xmp.spawn initialises PJRT inside spawned child processes which use the gRPC
-  path instead of VFIO.  Do NOT call xm.xla_device() in main().
+Model (v2 vs v1):
+  dim 256→512, embed_dim 128→256, n_heads 4→8, expert_dim 256→512,
+  n_routed_experts 2→4, lm_head_dim 128 (factored), ~80M unique params.
+  max_loop_iters=6 retained — loop benefit confirmed in run-2 evaluation.
 
 Data pipeline (ChunkedDiskDataset):
   Downloads FineWeb-Edu in large chunks (~400M tokens) to a local binary file,
@@ -17,7 +17,7 @@ Data pipeline (ChunkedDiskDataset):
   runs on the current one — the XLA compute path never blocks on the network.
   Chunk file size: ~1.6 GB (400M × int32).  Disk usage: ≤2 chunks at a time.
 
-Batch:  8 micro × 32 accum × 2048 = 524 288 tokens/step
+Batch:  4 micro × 32 accum × 4096 = 524 288 tokens/step
 """
 
 import os
@@ -39,14 +39,14 @@ from kashf.model import KashfConfig, KashfModel
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
 
-SEQ_LEN      = 2048
-MICRO_BATCH  = 8
-GRAD_ACCUM   = 32   # 8 × 32 × 2048 = 524 288 tokens/step
+SEQ_LEN      = 4096
+MICRO_BATCH  = 4
+GRAD_ACCUM   = 32   # 4 × 32 × 4096 = 524 288 tokens/step
 
 LR           = 3e-4
 MIN_LR       = 3e-5
 WEIGHT_DECAY = 0.1
-WARMUP_STEPS = 1000
+WARMUP_STEPS = 2000
 TARGET_TOKENS = 50_000_000_000
 
 LOG_EVERY    = 10
@@ -274,18 +274,18 @@ def _train_fn(index: int, cli_args):
 
     cfg = KashfConfig(
         vocab_size       = vocab_size,
-        dim              = 256,
-        embed_dim        = 128,
-        n_heads          = 4,
+        dim              = 512,
+        embed_dim        = 256,
+        n_heads          = 8,
         head_dim         = 64,
         max_seq_len      = SEQ_LEN,
-        max_loop_iters   = 4,
-        n_routed_experts = 2,
+        max_loop_iters   = 6,
+        n_routed_experts = 4,
         n_shared_experts = 1,
-        expert_dim       = 256,
+        expert_dim       = 512,
         act_threshold    = 0.99,
         rope_theta       = 500_000.0,
-        lm_head_dim      = 64,
+        lm_head_dim      = 128,   # factored head: 512→128→vocab avoids 512×50K=25.7M dead weight
     )
     model = KashfModel(cfg).to(torch.bfloat16).to(device)
 
@@ -294,7 +294,7 @@ def _train_fn(index: int, cli_args):
         mprint(f"Parameters : {counts['total']:,} total | {counts['unique (deduped)']:,} unique")
         mprint(f"Device     : {device}  |  world_size: {world_size}")
         mprint(f"SEQ_LEN: {SEQ_LEN}  |  micro-batch: {MICRO_BATCH}  |  grad-accum: {GRAD_ACCUM}")
-        mprint(f"max_loop_iters: 4  |  lm_head_dim: 64  |  target: {TARGET_TOKENS/1e9:.0f}B tokens")
+        mprint(f"max_loop_iters: {cfg.max_loop_iters}  |  lm_head_dim: {cfg.lm_head_dim}  |  target: {TARGET_TOKENS/1e9:.0f}B tokens")
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LR,
